@@ -148,3 +148,145 @@ EXPLAIN ANALYZE SELECT * FROM transactions WHERE montant_euros > 0;  -- 20 000 l
 Chaque membre commite son propre travail — l'historique Git montre qui a fait
 quoi. Une partie par personne (tables/données, fonction/procédure/trigger,
 vues/rôles, index/README).
+
+---
+
+# Comprendre et défendre le projet (révision)
+
+> Le jour de la présentation (8 min de démo + 4 min de questions), **le prof
+> interroge un membre au hasard** : chacun doit pouvoir expliquer n'importe
+> quelle partie. Cette section contient tout ce qu'il faut savoir.
+
+## La démo, pas à pas (trame imposée : rôle → vue → index → trigger)
+
+Préparer ces requêtes dans un fichier et les jouer **en direct sur la base**
+(pas de diaporama). D'abord lancer le script, puis :
+
+```sql
+-- 0) Montrer que tout est chargé
+SELECT count(*) FROM transactions;         -- 20 000
+
+-- 1) UN RÔLE : moindre privilège
+SET ROLE emma;                             -- Emma travaille au guichet (rôle caissier)
+SELECT * FROM vue_caissier LIMIT 3;        -- AUTORISÉ
+SELECT * FROM clients LIMIT 1;             -- REFUSÉ : permission denied for table clients
+RESET ROLE;
+
+-- 2) UNE VUE : ce qu'elle montre et ce qu'elle cache
+SELECT * FROM vue_caissier LIMIT 3;        -- nom masqué "Prenom1 N.", solde calculé, PAS d'e-mail
+SELECT * FROM vue_analyste;                -- stats agrégées par commerçant, aucune donnée nominative
+
+-- 3) UN INDEX : la requête, le temps avant, le temps après
+DROP INDEX transactions_carte_idx;
+EXPLAIN ANALYZE SELECT * FROM transactions WHERE carte_id = 42;   -- Seq Scan, ~1,2 ms
+CREATE INDEX transactions_carte_idx ON transactions (carte_id);
+EXPLAIN ANALYZE SELECT * FROM transactions WHERE carte_id = 42;   -- Index Scan, ~0,05 ms
+
+-- 4) UN TRIGGER : l'action qui le déclenche, et ce qu'on observe
+SELECT solde_points(1);                                           -- ex. 14 180
+INSERT INTO echanges (carte_id, recompense_id, points_depenses)
+VALUES (1, 1, 999999);                     -- REFUSÉ : "Solde insuffisant pour la carte 1 …"
+INSERT INTO transactions (carte_id, montant_euros, points, canal)
+VALUES (50, 10, 100, 'caisse');            -- REFUSÉ : "Carte 50 bloquée …"
+```
+
+## Les notions, expliquées
+
+### Fonction vs procédure
+- Une **fonction** *calcule et renvoie une valeur* ; on l'utilise dans une
+  requête, comme une colonne : `SELECT solde_points(1);`. La nôtre est en
+  `LANGUAGE sql` (son corps est une simple requête).
+- Une **procédure** *agit* (elle écrit) et ne renvoie rien ; on l'appelle avec
+  `CALL echanger_recompense(1, 1);`. La nôtre est en `LANGUAGE plpgsql` (elle a
+  des `IF`, des variables, des `RAISE EXCEPTION`).
+- `RAISE EXCEPTION 'texte %', valeur` **arrête tout et annule** ce qui a été
+  écrit : une procédure ne laisse jamais un travail à moitié fait.
+
+### Les triggers
+- Un **trigger** est une fonction (qui renvoie le type `trigger`) que la base
+  exécute **toute seule** quand une table est modifiée. Personne ne l'appelle :
+  **impossible de l'oublier**, par aucun canal (caisse, appli, web).
+- Il s'écrit en deux morceaux : la **fonction** (`RETURNS trigger`) + le
+  **trigger** qui l'accroche à une table (`CREATE TRIGGER … BEFORE INSERT ON …`).
+- **`BEFORE`** s'exécute *avant* l'écriture : il sert à **refuser**
+  (`RAISE EXCEPTION`) ou corriger la ligne, et finit par `RETURN NEW`.
+  **`AFTER`** s'exécute *après* : il sert à écrire ailleurs (un journal, un
+  compteur), et finit par `RETURN NULL`.
+- **`NEW`** = la ligne qui arrive ; **`OLD`** = la ligne avant modification
+  (dans un `UPDATE`/`DELETE`).
+- Nos deux triggers sont des `BEFORE INSERT` qui **refusent** : solde
+  insuffisant sur `echanges`, carte bloquée sur `transactions`.
+
+### Pourquoi la règle est DANS la base (et pas dans l'application)
+- Une règle qui doit tenir **quel que soit le chemin** (caisse, appli, web) va
+  en base : si chaque application la vérifiait de son côté, un seul oubli
+  suffirait (c'est l'histoire de Knight Capital : une règle en 8 exemplaires,
+  un seul pas à jour → 440 M$ perdus).
+- Un **trigger protège, il ne pilote pas.** Ce qui change souvent (un tarif,
+  une promotion) ou ce qui sort de la base (paiement, e-mail) reste dans
+  l'application.
+
+### Les index
+- Un index, c'est l'index d'un livre : au lieu de lire toute la table
+  (**`Seq Scan`**), on va droit aux bonnes lignes (**`Index Scan`**).
+- On **mesure** avec `EXPLAIN ANALYZE` (qui exécute vraiment la requête). On
+  repère : `Seq Scan` (toute la table), `Index Scan`/`Bitmap Index Scan`
+  (passage par l'index), et `Execution Time` (la dernière ligne).
+- **PostgreSQL n'indexe pas les clés étrangères tout seul** — seulement les clés
+  primaires et les colonnes `UNIQUE`. C'est le premier endroit où chercher :
+  d'où notre index sur `transactions(carte_id)`.
+- Un index a un **coût** : il occupe de la place et ralentit chaque écriture.
+  On n'indexe donc pas tout. Un index qui ramène *presque toute* la table
+  (ex. `montant_euros > 0`) ne sert à rien : PostgreSQL garde un `Seq Scan`.
+
+### Les rôles et les privilèges (DCL)
+- **Principe du moindre privilège** : chaque compte n'a que les droits dont il a
+  besoin (Equifax, 2017 : un seul compte ouvrait 48 bases → 147 M de personnes).
+- On donne les droits au **rôle-métier** (`caissier`, `analyste`), jamais à la
+  personne. La **personne** (`emma`, `hugo`) se connecte et **hérite** du rôle.
+  Quand la personne part, on la supprime ; les droits du rôle ne bougent pas.
+- `GRANT` donne un droit, `REVOKE` le retire, `SET ROLE` / `RESET ROLE` permet
+  de tester en devenant quelqu'un d'autre. Un rôle qui n'a rien reçu n'a droit
+  à rien.
+
+### Les vues
+- Une **vue** est une requête enregistrée sous un nom ; on l'interroge comme une
+  table, mais elle ne stocke rien. Elle sert à **cacher la complexité** (les
+  jointures) et à **protéger les données** (masquer l'e-mail, le nom).
+- Le duo à retenir : **le droit sur la vue, pas sur la table.** `analyste` peut
+  lire `vue_analyste` mais pas `transactions` ; `caissier` lit `vue_caissier`
+  mais pas `clients`.
+
+## Les questions probables du prof (et les réponses)
+
+- **« Pourquoi ce trigger est-il dans la base ? »** → Parce que la règle (ne pas
+  dépenser plus que le solde) doit tenir quel que soit le canal. En base, elle
+  est impossible à contourner ou à oublier.
+- **« Différence entre une fonction et une procédure ? »** → La fonction calcule
+  et renvoie (`SELECT`), la procédure agit et ne renvoie rien (`CALL`).
+- **« Pourquoi `solde_points` est en SQL et `echanger_recompense` en plpgsql ? »**
+  → La fonction est une simple requête (`sql` suffit). La procédure a besoin de
+  logique (`IF`, variables, `RAISE`) → `plpgsql`.
+- **« Pourquoi cet index-là et pas un autre ? »** → `carte_id` est une clé
+  étrangère très filtrée (l'historique d'une carte = ~40 lignes sur 20 000) et
+  PostgreSQL ne l'indexe pas seul → gros gain mesuré (23×). Un index sur une
+  colonne qui ramène presque tout (`montant_euros > 0`) ne servirait à rien.
+- **« Que cache la vue du caissier ? »** → L'e-mail et le nom complet du client ;
+  elle ne montre que `Prénom I.` et le solde. Le caissier n'a aucun droit sur la
+  table `clients`.
+- **« Différence entre un rôle et un utilisateur ? »** → Le rôle-métier
+  (`NOLOGIN`) porte les droits ; l'utilisateur (`LOGIN`) se connecte et en
+  hérite. On gère les droits une fois, au niveau du rôle.
+- **« Que se passe-t-il si une erreur survient au milieu d'une procédure ? »** →
+  `RAISE EXCEPTION` annule tout ce qui a été écrit depuis le début (transaction
+  implicite) : aucun état à moitié écrit.
+- **« C'est quoi `NEW` et `OLD` ? »** → Dans un trigger, `NEW` est la ligne qui
+  arrive, `OLD` la ligne telle qu'elle était avant (en `UPDATE`/`DELETE`).
+
+## Le barème (/20), pour savoir où sont les points
+DCL, rôles et privilèges **5** · Fonctions, procédures, triggers **5** · Vues et
+abstraction **4** · Index et justification **4** · Qualité du script **2**.
+Pièges qui coûtent cher : un seul rôle qui a tout · le profil garde le droit sur
+la table (la vue ne protège plus) · aucun temps avant/après pour l'index · un
+trigger qui ne protège rien · le script échoue sur une base vide (objets dans le
+mauvais ordre).
