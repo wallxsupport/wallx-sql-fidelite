@@ -1,17 +1,20 @@
 -- =============================================================================
 -- Projet SQL avancé — Programme de fidélité « WallX »
 -- PostgreSQL 16
--- Groupe : <À COMPLÉTER : nom du groupe + membres>
+-- Groupe : Souleymane Sall, Michael Esclavy, Lydia El Gh.
 --
 -- Ce script s'exécute sur une base VIDE, d'un bloc :
 --     psql -U wallx -d projet -f projet.sql
+-- Il est rejouable : relancé sur une base déjà remplie, il repart propre.
 -- Ordre imposé par le sujet : tables, données, fonction/procédure, trigger,
 -- vues, rôles, index.
 --
 -- Domaine : une carte de fidélité par (client, commerçant). Chaque achat
 -- crédite des points (1 € = 10 points). Le client échange ses points contre
--- des récompenses. La base garantit elle-même qu'on ne dépense pas plus de
--- points qu'on n'en a — quel que soit le canal (caisse, appli, web).
+-- des récompenses. La base garantit elle-même l'intégrité des points — on ne
+-- forge pas de points, on ne dépense pas plus que son solde, on n'échange pas
+-- une récompense d'un autre commerçant — quel que soit le canal (caisse,
+-- appli, web).
 -- =============================================================================
 
 
@@ -67,6 +70,7 @@ CREATE TABLE recompenses (
 );
 
 -- La plus grosse table : chaque achat crédite des points sur une carte.
+-- `points` est calculé par la base (trigger section 4), jamais fourni par le client.
 CREATE TABLE transactions (
     id             serial PRIMARY KEY,
     carte_id       integer NOT NULL REFERENCES cartes (id),
@@ -77,6 +81,7 @@ CREATE TABLE transactions (
 );
 
 -- Un échange = une dépense de points contre une récompense.
+-- `points_depenses` est fixé par la base d'après le coût de la récompense.
 CREATE TABLE echanges (
     id               serial PRIMARY KEY,
     carte_id         integer NOT NULL REFERENCES cartes (id),
@@ -122,6 +127,7 @@ SELECT 1 + ((i - 1) % 5),
 FROM generate_series(1, 15) AS g(i);
 
 -- 20 000 transactions. Montant entre 5 et 50 €, points = montant x 10.
+-- (les triggers n'existent pas encore : le chargement initial est direct et rapide)
 INSERT INTO transactions (carte_id, montant_euros, points, canal, cree_le)
 SELECT 1 + (i % 500) AS carte_id,
        montant,
@@ -145,6 +151,9 @@ JOIN LATERAL (
     LIMIT 1
 ) r ON true;
 
+-- Statistiques à jour pour que le planificateur choisisse les bons plans.
+ANALYZE;
+
 
 -- =============================================================================
 -- 3. LA FONCTION ET LA PROCÉDURE
@@ -162,8 +171,9 @@ AS $$
 $$;
 
 -- PROCÉDURE : échanger une récompense. Elle AGIT (elle écrit) et REFUSE les cas
--- invalides. Le contrôle du solde, lui, est délégué au trigger (section 4) :
--- ainsi la règle tient même si quelqu'un insère un échange sans passer par ici.
+-- invalides avec des messages clairs. C'est la "porte d'entrée" applicative ;
+-- la garantie dure, elle, est dans le trigger (section 4), impossible à
+-- contourner même par un INSERT direct.
 CREATE OR REPLACE PROCEDURE echanger_recompense(p_carte_id int, p_recompense_id int)
 LANGUAGE plpgsql
 AS $$
@@ -188,7 +198,7 @@ BEGIN
         RAISE EXCEPTION 'Récompense % indisponible pour cette carte', p_recompense_id;
     END IF;
 
-    -- L'insertion déclenche le trigger qui vérifie le solde (section 4).
+    -- L'insertion déclenche le trigger qui refait les contrôles et vérifie le solde.
     INSERT INTO echanges (carte_id, recompense_id, points_depenses)
     VALUES (p_carte_id, p_recompense_id, v_cout);
 END;
@@ -199,45 +209,87 @@ $$;
 -- 4. LES TRIGGERS  (un trigger protège, il ne pilote pas)
 -- =============================================================================
 
--- Trigger 1 — REFUSER de dépenser plus de points que le solde.
+-- Trigger 1 — CONTRÔLER CHAQUE ÉCHANGE (BEFORE INSERT sur echanges).
 -- En base, car la règle doit tenir quel que soit le canal : si chaque appli
--- (caisse, mobile, web) la vérifiait de son côté, un oubli suffirait à créer
--- des points à partir de rien.
-CREATE OR REPLACE FUNCTION verifier_solde_echange()
+-- (caisse, mobile, web) la vérifiait de son côté, un seul oubli suffirait à
+-- créer des points à partir de rien. Le trigger :
+--   - refuse une carte inconnue ou bloquée ;
+--   - refuse une récompense inactive ou d'un AUTRE commerçant ;
+--   - fixe lui-même points_depenses au coût réel (une valeur fournie est ignorée) ;
+--   - refuse si le solde est insuffisant.
+CREATE OR REPLACE FUNCTION controler_echange()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    v_cout         integer;
+    v_comm_carte   integer;
+    v_comm_reco    integer;
+    v_statut       text;
+    v_solde        integer;
 BEGIN
-    IF solde_points(NEW.carte_id) < NEW.points_depenses THEN
-        RAISE EXCEPTION 'Solde insuffisant pour la carte % : solde = %, demandé = %',
-            NEW.carte_id, solde_points(NEW.carte_id), NEW.points_depenses;
+    SELECT statut, commercant_id INTO v_statut, v_comm_carte
+    FROM cartes WHERE id = NEW.carte_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Carte % inconnue', NEW.carte_id;
     END IF;
-    RETURN NEW;      -- BEFORE INSERT : on laisse passer la ligne
+    IF v_statut <> 'active' THEN
+        RAISE EXCEPTION 'Carte % bloquée : échange impossible', NEW.carte_id;
+    END IF;
+
+    SELECT cout_points, commercant_id INTO v_cout, v_comm_reco
+    FROM recompenses WHERE id = NEW.recompense_id AND actif;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Récompense % inconnue ou inactive', NEW.recompense_id;
+    END IF;
+    IF v_comm_reco <> v_comm_carte THEN
+        RAISE EXCEPTION 'Récompense % appartient à un autre commerçant', NEW.recompense_id;
+    END IF;
+
+    NEW.points_depenses := v_cout;      -- le coût fait foi, pas la valeur fournie
+
+    v_solde := solde_points(NEW.carte_id);
+    IF v_solde < v_cout THEN
+        RAISE EXCEPTION 'Solde insuffisant pour la carte % : solde = %, coût = %',
+            NEW.carte_id, v_solde, v_cout;
+    END IF;
+
+    RETURN NEW;      -- BEFORE INSERT : on laisse passer la ligne (corrigée)
 END;
 $$;
 
-CREATE TRIGGER echanges_verifier_solde
+CREATE TRIGGER echanges_controler
     BEFORE INSERT ON echanges
     FOR EACH ROW
-    EXECUTE FUNCTION verifier_solde_echange();
+    EXECUTE FUNCTION controler_echange();
 
--- Trigger 2 — une carte bloquée ne gagne plus de points.
-CREATE OR REPLACE FUNCTION verifier_carte_active()
+-- Trigger 2 — CONTRÔLER CHAQUE TRANSACTION (BEFORE INSERT sur transactions).
+--   - refuse de créditer une carte bloquée ;
+--   - calcule points = montant x 10 (on ne peut pas forger de points).
+CREATE OR REPLACE FUNCTION controler_transaction()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    v_statut text;
 BEGIN
-    IF (SELECT statut FROM cartes WHERE id = NEW.carte_id) = 'bloquee' THEN
+    SELECT statut INTO v_statut FROM cartes WHERE id = NEW.carte_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Carte % inconnue', NEW.carte_id;
+    END IF;
+    IF v_statut = 'bloquee' THEN
         RAISE EXCEPTION 'Carte % bloquée : aucun point ne peut être crédité', NEW.carte_id;
     END IF;
+
+    NEW.points := round(NEW.montant_euros * 10)::int;   -- 1 € = 10 points, calculé par la base
     RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER transactions_carte_active
+CREATE TRIGGER transactions_controler
     BEFORE INSERT ON transactions
     FOR EACH ROW
-    EXECUTE FUNCTION verifier_carte_active();
+    EXECUTE FUNCTION controler_transaction();
 
 
 -- =============================================================================
@@ -284,8 +336,10 @@ CREATE ROLE emma LOGIN PASSWORD 'emma' IN ROLE caissier;
 CREATE ROLE hugo LOGIN PASSWORD 'hugo' IN ROLE analyste;
 
 -- CAISSIER : fait le travail courant. Il lit le catalogue et l'historique,
--- crédite des points et enregistre des échanges. Il ne touche PAS la table
--- clients (données personnelles) : il passe par sa vue.
+-- crédite des points et enregistre des échanges — mais ne peut ni modifier ni
+-- supprimer (pas d'UPDATE/DELETE), et ne touche PAS la table clients (données
+-- personnelles) : il passe par sa vue. Les montants et coûts sont, de toute
+-- façon, imposés par les triggers.
 GRANT SELECT ON commercants, recompenses, cartes, transactions, echanges TO caissier;
 GRANT INSERT ON transactions, echanges TO caissier;
 GRANT USAGE, SELECT ON SEQUENCE transactions_id_seq, echanges_id_seq TO caissier;
@@ -313,10 +367,13 @@ CREATE INDEX transactions_cree_le_idx ON transactions (cree_le);
 
 
 -- =============================================================================
--- FIN. Démo rapide (à lancer à la main, pas exécutée ici) :
+-- FIN. Démo rapide (à lancer à la main) :
 --   SELECT solde_points(1);
---   CALL echanger_recompense(1, 1);
---   SET ROLE emma;  SELECT * FROM vue_caissier LIMIT 3;  SELECT * FROM clients;  -- refusé
---   SET ROLE hugo;  SELECT * FROM vue_analyste;          SELECT * FROM transactions;  -- refusé
+--   CALL echanger_recompense(1, 1);                       -- ok
+--   SET ROLE emma;  SELECT * FROM vue_caissier LIMIT 3;   -- ok
+--                   SELECT * FROM clients;                -- refusé
+--   RESET ROLE;
+--   SET ROLE hugo;  SELECT * FROM vue_analyste;           -- ok
+--                   SELECT * FROM transactions;           -- refusé
 --   RESET ROLE;
 -- =============================================================================

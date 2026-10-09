@@ -2,8 +2,9 @@
 
 Base PostgreSQL d'un programme de fidélité : une carte par (client, commerçant),
 des points gagnés à chaque achat (1 € = 10 points) et échangés contre des
-récompenses. La base garantit elle-même qu'on ne dépense jamais plus de points
-qu'on n'en possède, quel que soit le canal (caisse, appli, web).
+récompenses. La base garantit elle-même l'**intégrité des points** — on ne forge
+pas de points, on ne dépense jamais plus que son solde, on n'échange pas une
+récompense d'un autre commerçant — quel que soit le canal (caisse, appli, web).
 
 **Groupe :** Souleymane Sall (@wallxsupport), Lydia El Gh. (@lydia-elgh), Michael Esclavy (@Michi-esc)
 
@@ -62,21 +63,41 @@ flowchart LR
   CALL echanger_recompense(1, 999);               -- ERROR: Récompense 999 indisponible
   ```
 
-### Trigger — `echanges_verifier_solde` (BEFORE INSERT ON echanges)
-- **Ce qu'il fait :** refuse tout échange dont le coût dépasse le solde de la
-  carte.
-- **Pourquoi dans la base plutôt que dans l'application :** la règle doit tenir
-  quel que soit le chemin (caisse, appli, web). Si chaque application la
+### Triggers (BEFORE INSERT — un trigger protège, il ne pilote pas)
+
+**`echanges_controler` (BEFORE INSERT ON echanges)** — rend chaque échange
+infalsifiable, quel que soit le canal :
+- refuse une carte inconnue ou **bloquée** ;
+- refuse une récompense inactive ou **d'un autre commerçant** ;
+- **fixe lui-même** `points_depenses` au coût réel de la récompense (une valeur
+  fournie est ignorée) ;
+- refuse si le **solde est insuffisant**.
+
+**`transactions_controler` (BEFORE INSERT ON transactions)** :
+- refuse de créditer une carte **bloquée** ;
+- **calcule** `points = montant × 10` — on ne peut pas forger de points.
+
+- **Pourquoi dans la base plutôt que dans l'application :** ces règles doivent
+  tenir quel que soit le chemin (caisse, appli, web). Si chaque application les
   vérifiait de son côté, un seul oubli permettrait de créer des points à partir
-  de rien. En base, elle est impossible à contourner.
-- **La preuve :**
+  de rien. En base, elles sont impossibles à contourner.
+- **Les preuves :**
   ```sql
-  -- une carte dont le solde est insuffisant pour 999 999 points
-  INSERT INTO echanges (carte_id, recompense_id, points_depenses)
-  VALUES (1, 1, 999999);     -- ERROR: Solde insuffisant pour la carte 1 : solde = ..., demandé = 999999
+  -- récompense d'un AUTRE commerçant (carte 1 = comm. 1, récompense 2 = comm. 2)
+  INSERT INTO echanges (carte_id, recompense_id, points_depenses) VALUES (1, 2, 500);
+  -- ERROR: Récompense 2 appartient à un autre commerçant
+
+  -- points forgés ignorés : on envoie 999999 pour un achat de 5 € → 50 points stockés
+  INSERT INTO transactions (carte_id, montant_euros, points, canal)
+  VALUES (1, 5.00, 999999, 'caisse') RETURNING points;          -- points = 50
+
+  -- carte bloquée (carte 50) : aucun crédit
+  INSERT INTO transactions (carte_id, montant_euros, points, canal)
+  VALUES (50, 10, 100, 'caisse');     -- ERROR: Carte 50 bloquée …
+
+  -- solde insuffisant : sur une carte neuve (0 point), l'échange est refusé
+  -- ERROR: Solde insuffisant pour la carte N : solde = 0, coût = 500
   ```
-- **Second trigger** `transactions_carte_active` : une carte bloquée ne gagne
-  plus de points (`INSERT INTO transactions` refusé sur une carte `bloquee`).
 
 ### Vues
 - **`vue_caissier` :** solde d'une carte + client au nom masqué (`Prenom N.`),
@@ -183,11 +204,14 @@ CREATE INDEX transactions_carte_idx ON transactions (carte_id);
 EXPLAIN ANALYZE SELECT * FROM transactions WHERE carte_id = 42;   -- Index Scan, ~0,05 ms
 
 -- 4) UN TRIGGER : l'action qui le déclenche, et ce qu'on observe
-SELECT solde_points(1);                                           -- ex. 14 180
-INSERT INTO echanges (carte_id, recompense_id, points_depenses)
-VALUES (1, 1, 999999);                     -- REFUSÉ : "Solde insuffisant pour la carte 1 …"
+-- a) récompense d'un autre commerçant → REFUSÉ
+INSERT INTO echanges (carte_id, recompense_id, points_depenses) VALUES (1, 2, 500);
+-- b) points forgés ignorés : achat 5 € → 50 points (pas 999999)
 INSERT INTO transactions (carte_id, montant_euros, points, canal)
-VALUES (50, 10, 100, 'caisse');            -- REFUSÉ : "Carte 50 bloquée …"
+VALUES (1, 5.00, 999999, 'caisse') RETURNING points;
+-- c) carte bloquée → REFUSÉ
+INSERT INTO transactions (carte_id, montant_euros, points, canal)
+VALUES (50, 10, 100, 'caisse');            -- "Carte 50 bloquée …"
 ```
 
 ## Les notions, expliquées
@@ -214,8 +238,10 @@ VALUES (50, 10, 100, 'caisse');            -- REFUSÉ : "Carte 50 bloquée …"
   compteur), et finit par `RETURN NULL`.
 - **`NEW`** = la ligne qui arrive ; **`OLD`** = la ligne avant modification
   (dans un `UPDATE`/`DELETE`).
-- Nos deux triggers sont des `BEFORE INSERT` qui **refusent** : solde
-  insuffisant sur `echanges`, carte bloquée sur `transactions`.
+- Nos deux triggers sont des `BEFORE INSERT` qui **refusent** les opérations
+  invalides (carte bloquée, récompense d'un autre commerçant, solde insuffisant)
+  et **corrigent** la ligne (`points` calculés, `points_depenses` imposé au coût
+  réel) — on ne peut ni forger des points ni détourner une récompense.
 
 ### Pourquoi la règle est DANS la base (et pas dans l'application)
 - Une règle qui doit tenir **quel que soit le chemin** (caisse, appli, web) va
