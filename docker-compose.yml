@@ -1,0 +1,16 @@
+# Postgres jetable pour tester projet.sql sur une base vide.
+# Usage :
+#   docker compose up -d
+#   docker compose exec -T db psql -U wallx -d projet < projet.sql
+#   docker compose exec db psql -U wallx -d projet      # pour se promener
+# Repartir de zéro :
+#   docker compose down -v && docker compose up -d
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: wallx
+      POSTGRES_PASSWORD: wallx
+      POSTGRES_DB: projet
+    ports:
+      - "5433:5432"   # 5433 côté hôte pour ne pas gêner un Postgres déjà installé
